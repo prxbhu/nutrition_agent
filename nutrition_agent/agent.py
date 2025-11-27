@@ -1,8 +1,9 @@
 from asyncio import events
-from google.adk.agents import Agent, SequentialAgent
+from google.adk.agents import Agent, SequentialAgent, LoopAgent
 from google.adk.models.google_llm import Gemini
 from google.adk.runners import Runner
 from google.adk.tools import FunctionTool, google_search
+from google.adk.tools.agent_tool import AgentTool
 from google.adk.plugins.logging_plugin import LoggingPlugin
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
@@ -21,7 +22,7 @@ load_dotenv()
 APP_NAME="nutrition_agent"
 USER_ID="user1234"
 SESSION_ID="1234"
-MODEL_ID="gemini-2.0-flash"
+MODEL_ID="gemini-2.5-flash-lite"
 
 retry_config=types.HttpRetryOptions(
     attempts=5,  # Maximum retry attempts
@@ -29,21 +30,6 @@ retry_config=types.HttpRetryOptions(
     initial_delay=1,
     http_status_codes=[429, 500, 503, 504], # Retry on these HTTP errors
 )
-
-
-
-# MCP Toolset for nutrition data
-nutrition_server = McpToolset(
-    connection_params=StdioConnectionParams(
-        server_params=StdioServerParameters(
-            command="/home/prxbhu/.nvm/versions/node/v22.17.0/bin/node",
-            args=["/home/prxbhu/Documents/mcp-opennutrition/build/index.js"],
-            tool_filter=["search-food-by-name"]
-        ),
-        timeout=30,
-    )
-)
-
 
 #sample data
 def analyze_health_metrics() -> str:
@@ -75,281 +61,484 @@ def analyze_health_metrics() -> str:
         return json.dumps({"error": f"Invalid JSON format: {str(e)}"})
 
 
+# Web Search Agent instead of direct google_search tool use
+web_search_agent = Agent(
+    name="web_search_agent",
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
+    instruction="""You are a web search specialist. Your job is to perform web searches and return relevant results.
+
+                When given a search query, use the google_search tool to find information and return the most relevant results in a clear, structured format.
+
+                **Response Format:**
+                Provide a concise summary of the most relevant information found, focusing on:
+                - Key facts and data
+                - Reliable sources
+                - Relevant details to the query
+
+                Be factual and cite sources when possible.""",
+    tools=[google_search],
+    output_key="search_results"
+)
+
+web_search_tool = AgentTool(web_search_agent)
+
+
 
 # Agent 1: Patient Data Retrieval and Analysis
 patient_data_agent = Agent(
-    model=Gemini(model="gemini-2.0-flash-exp", retry_options=retry_config),
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
     name="patient_data_agent",
-    instruction="""You are a patient data retrieval and analysis specialist. Your role is to:
+    instruction="""You are a patient data retrieval and analysis specialist.
 
-    1. USE the analyze_health_metrics tool to fetch patient data
-    2. Thoroughly analyze the questionnaire responses:
-    - Extract age, gender, height, weight, BMI
-    - Identify dietary preference (vegetarian/non-vegetarian)
-    - Note medical conditions (diabetes, hypertension, cholesterol issues, etc.)
-    - Document genetic conditions
-    - Review lifestyle factors (exercise frequency, water intake, alcohol consumption, smoking)
-    - Identify meal preparation preferences and eating habits
-    - Note any food allergies or restrictions
+                **TASK:**
+                1. Call the analyze_health_metrics tool to fetch patient data
+                2. Analyze the data comprehensively
+                3. Output a structured JSON report
 
-    3. Analyze blood test measurements:
-    - Compare each value against reference ranges
-    - Flag any abnormal values (high or low)
-    - Identify nutritional deficiencies or concerns
-    - Note any critical health markers
+                **OUTPUT FORMAT - You MUST respond with ONLY valid JSON in this exact structure:**
 
-    4. Create a comprehensive health summary that includes:
-    - Patient demographics and anthropometrics (age, gender, height, weight, BMI)
-    - Complete dietary preferences and restrictions
-    - All medical and genetic conditions
-    - Lifestyle assessment
-    - Blood parameter analysis with abnormalities highlighted
-    - Key nutritional considerations based on health status
+                ```json
+                {
+                "patient_profile": {
+                    "age": <number or "unknown">,
+                    "gender": "<male/female/unknown>",
+                    "height_cm": <number>,
+                    "weight_kg": <number>,
+                    "bmi": <number>,
+                    "bmi_category": "<underweight/normal/overweight/obese>"
+                },
+                "dietary_preferences": {
+                    "type": "<vegetarian/non-vegetarian/eggetarian>",
+                    "restrictions": ["<list of restrictions>"],
+                    "meal_prep_preference": "<home-cooked/outside/mixed>",
+                    "eating_frequency": "<description>"
+                },
+                "medical_conditions": {
+                    "current": ["<list of current conditions>"],
+                    "family_history": ["<list of family history conditions>"],
+                    "allergies": ["<list of allergies>"]
+                },
+                "lifestyle_factors": {
+                    "exercise_minutes_per_week": <number>,
+                    "exercise_level": "<sedentary/lightly_active/moderately_active/very_active>",
+                    "water_intake_glasses": "<range or number>",
+                    "alcohol": "<never/occasional/moderate/frequent>",
+                    "smoking": "<never/former/current>",
+                    "sleep_hours": <number>,
+                    "stress_level": "<low/moderate/high>",
+                    "screen_time_hours": <number>
+                },
+                "blood_test_analysis": {
+                    "abnormal_values": [
+                    {
+                        "parameter": "<name>",
+                        "value": <number>,
+                        "unit": "<unit>",
+                        "reference_range": "<range>",
+                        "status": "<high/low>",
+                        "clinical_significance": "<description>"
+                    }
+                    ],
+                    "deficiencies": ["<list of identified deficiencies>"],
+                    "health_risks": ["<list of health risks identified>"]
+                },
+                "key_nutritional_considerations": [
+                    "<consideration 1>",
+                    "<consideration 2>",
+                    "<consideration 3>"
+                ]
+                }
+                ```
 
-    Format your output clearly with sections:
-    **PATIENT PROFILE:**
-    - Demographics
-    - Anthropometrics
-
-    **DIETARY PREFERENCES:**
-    - Type (veg/non-veg)
-    - Restrictions
-    - Meal preparation preferences
-
-    **MEDICAL CONDITIONS:**
-    - List all conditions
-
-    **LIFESTYLE FACTORS:**
-    - Exercise, water intake, habits
-
-    **BLOOD TEST ANALYSIS:**
-    - Normal values
-    - Abnormal values (flagged)
-    - Nutritional concerns
-
-    **KEY NUTRITIONAL CONSIDERATIONS:**
-    - Summary of dietary needs based on health status
-
-    IMPORTANT: You MUST call the analyze_health_metrics tool first to get the patient data before providing any analysis.""",
+                **IMPORTANT:** 
+                - Output ONLY the JSON, no additional text before or after
+                - Ensure all JSON is valid and properly formatted
+                - Use the analyze_health_metrics tool first to get the data""",
     tools=[FunctionTool(func=analyze_health_metrics)],
     output_key="patient_health_data"
 )
 
 # Agent 2: Nutrition Requirements Calculator
 nutrition_calculator_agent = Agent(
-    model=Gemini(model="gemini-2.0-flash-exp", retry_options=retry_config),
+    model=Gemini(model="gemini-2.5-flash-lite", retry_options=retry_config),
     name="nutrition_calculator_agent",
-    instruction="""You are a nutritional requirements calculator. Based on the patient health data provided by the previous agent: {patient_health_data}
+    instruction="""You are a nutritional requirements calculator.
 
-                1. Calculate daily caloric needs:
-                - Use Harris-Benedict or Mifflin-St Jeor equation for BMR
-                - Formula for males: BMR = 10 × weight(kg) + 6.25 × height(cm) - 5 × age(years) + 5
-                - Formula for females: BMR = 10 × weight(kg) + 6.25 × height(cm) - 5 × age(years) - 161
-                - Apply activity level multiplier:
-                    * Sedentary (little/no exercise): BMR × 1.2
-                    * Lightly active (1-3 days/week): BMR × 1.375
-                    * Moderately active (3-5 days/week): BMR × 1.55
-                    * Very active (6-7 days/week): BMR × 1.725
-                    * Super active (physical job + exercise): BMR × 1.9
+                **INPUT DATA:**
+                You will receive patient health data in JSON format:
+                {patient_health_data}
 
-                2. Determine optimal macronutrient distribution:
-                - Protein: Calculate based on body weight and activity
-                    * Sedentary: 0.8-1.0 g/kg
-                    * Active/fitness: 1.6-2.2 g/kg
-                    * Adjust for medical conditions (reduce if kidney issues)
-                - Carbohydrates: Adjust based on activity level and medical conditions
-                    * Standard: 45-65% of calories
-                    * Diabetes: Lower GI carbs, controlled portions
-                - Fats: Calculate remainder, ensuring minimum essential fat needs
-                    * Standard: 20-35% of calories
-                    * Focus on healthy fats for high cholesterol
+                **TASK:**
+                1. Calculate daily caloric needs using Mifflin-St Jeor equation
+                2. Determine macronutrient distribution
+                3. Apply medical condition adjustments
+                4. Calculate meal distribution
 
-                3. Apply medical condition adjustments:
-                - Diabetes: Lower glycemic index carbs, controlled carb portions, higher fiber
-                - Hypertension: Low sodium (< 2300mg/day or < 1500mg if severe)
-                - High cholesterol: Limit saturated fats, increase fiber (25-30g/day), omega-3 rich foods
-                - Thyroid issues: Ensure adequate iodine and selenium
-                - Vitamin/mineral deficiencies: Note supplementation needs
+                **CALCULATION FORMULAS:**
+                - BMR (Male): 10 × weight(kg) + 6.25 × height(cm) - 5 × age(years) + 5
+                - BMR (Female): 10 × weight(kg) + 6.25 × height(cm) - 5 × age(years) - 161
+                - Activity Multipliers: Sedentary=1.2, Lightly Active=1.375, Moderately Active=1.55, Very Active=1.725
 
-                4. Provide a clear nutritional prescription with this exact format:
+                **OUTPUT FORMAT - You MUST respond with ONLY valid JSON in this exact structure:**
 
-                **DAILY NUTRITIONAL TARGETS:**
-                - Total Calories: [X] kcal
-                - Protein: [X]g ([Y]%)
-                - Carbohydrates: [X]g ([Y]%)
-                - Fats: [X]g ([Y]%)
+                ```json 
+                {
+                "daily_targets": {
+                    "total_calories": <number>,
+                    "protein_grams": <number>,
+                    "protein_percentage": <number>,
+                    "carbohydrates_grams": <number>,
+                    "carbohydrates_percentage": <number>,
+                    "fats_grams": <number>,
+                    "fats_percentage": <number>,
+                    "fiber_grams": <number>,    
+                    "sodium_mg": <number>
+                },
+                "calculations": {
+                    "bmr": <number>,
+                    "activity_level": "<sedentary/lightly_active/moderately_active/very_active>",
+                    "activity_multiplier": <number>,
+                    "tdee": <number>
+                },
+                "special_dietary_guidelines": [
+                    "<guideline 1>",
+                    "<guideline 2>",
+                    "<guideline 3>"
+                ],
+                "meal_distribution": {
+                    "breakfast": {
+                    "percentage": <number>,
+                    "calories": <number>
+                    },
+                    "mid_morning_snack": {
+                    "percentage": <number>,
+                    "calories": <number>,
+                    "include": <boolean>
+                    },
+                    "lunch": {
+                    "percentage": <number>,
+                    "calories": <number>
+                    },
+                    "evening_snack": {
+                    "percentage": <number>,
+                    "calories": <number>,
+                    "include": <boolean>
+                    },
+                    "dinner": {
+                    "percentage": <number>,
+                    "calories": <number>
+                    }
+                },
+                "medical_adjustments": {
+                    "diabetes": "<adjustments if applicable>",
+                    "hypertension": "<adjustments if applicable>",
+                    "high_cholesterol": "<adjustments if applicable>",
+                    "vitamin_deficiencies": "<adjustments if applicable>"
+                },
+                "additional_recommendations": [
+                    "<recommendation 1>",
+                    "<recommendation 2>"
+                ]
+                }
+                ```
 
-                **SPECIAL DIETARY GUIDELINES:**
-                - [List specific guidelines like "Low sodium", "High fiber", "Low GI carbs", etc.]
-
-                **MEAL DISTRIBUTION:**
-                - Breakfast: [X]% ([Y] kcal)
-                - Mid-morning snack: [X]% ([Y] kcal) [if applicable]
-                - Lunch: [X]% ([Y] kcal)
-                - Evening snack: [X]% ([Y] kcal) [if applicable]
-                - Dinner: [X]% ([Y] kcal)
-
-                **ADDITIONAL RECOMMENDATIONS:**
-                - [Any specific nutrient focuses, timing considerations, hydration goals]
-
-                Use web search if you need current nutritional guidelines or specific medical dietary recommendations.""",
-    tools=[google_search],
+                **IMPORTANT:** 
+                - Output ONLY the JSON, no additional text
+                - Use web search using the web_search_tool if you need current nutritional guidelines
+                - Ensure calculations are accurate""",
+    tools=[web_search_tool],
     output_key="nutrition_requirements"
 )
 
-# Agent 3: Meal Planning
-meal_planning_agent = Agent(
+# Agent 3: Initial Meal Planning Agent
+initial_meal_planner_agent = Agent(
     model=Gemini(model="gemini-2.0-flash-exp", retry_options=retry_config),
-    name="meal_planning_agent",
-    instruction="""You are an expert meal planner specializing in Indian cuisine. Create a personalized daily meal plan that meets the nutritional requirements from the previous agent: {nutrition_requirements}
+    name="initial_meal_planner_agent",
+    instruction="""You are an expert meal planner specializing in Indian cuisine.
 
-                **CRITICAL: HOW TO USE THE search-food-by-name TOOL:**
+                **INPUT DATA:**
+                Patient Health Data: {patient_health_data}
+                Nutrition Requirements: {nutrition_requirements}
 
-                1. The tool accepts a "name" parameter with the food name
-                2. Search for foods using simple English names like:
-                - "chapati" or "roti" or "wheat bread"
-                - "rice" or "white rice" or "basmati rice"
-                - "dal" or "lentils" or "moong dal"
-                - "paneer" or "cottage cheese"
-                - "chicken breast" or "chicken"
-                - "milk" or "low fat milk"
-                - "apple" or "banana"
-                - "egg" or "boiled egg"
+                **TASK:**
+                Create an initial personalized Indian meal plan that meets the nutritional targets.
 
-                3. The tool returns nutritional information per 100g:
-                - calories (kcal)
-                - protein (g)
-                - carbohydrates (g)
-                - fats (g)
+                **PROCESS:**
+                1. Review patient preferences and restrictions from patient_health_data
+                2. Use nutrition_requirements for calorie and macro targets
+                3. Use web search to find accurate nutritional values for Indian foods
+                4. Calculate portions to meet targets
+                5. Ensure medical compliance
 
-                4. Calculate portions: If chapati per 100g has 300 kcal, and you need 150 kcal, serve 50g (half portion)
+                **SEARCH EXAMPLES:**
+                - "nutritional value of chapati per 100g"
+                - "calories in dal 1 cup"
+                - "paneer nutrition facts"
 
-                **MEAL PLANNING PROCESS:**
+                **OUTPUT FORMAT - You MUST respond with ONLY valid JSON in this exact structure:**
 
-                Step 1: For each meal, decide what foods to include based on:
-                - Nutritional targets from previous agent
-                - Dietary preferences (veg/non-veg)
-                - Medical conditions
-                - Cultural appropriateness
+                ```json
+                {
+                "meal_plan": {
+                    "breakfast": {
+                    "time": "7:00-8:00 AM",
+                    "target_calories": <number>,
+                    "foods": [
+                        {
+                        "name": "<food name>",
+                        "quantity": "<amount with unit>",
+                        "calories": <number>,
+                        "protein_g": <number>,
+                        "carbs_g": <number>,
+                        "fats_g": <number>
+                        }
+                    ],
+                    "preparation_notes": "<any special instructions>",
+                    "totals": {
+                        "calories": <number>,
+                        "protein_g": <number>,
+                        "carbs_g": <number>,
+                        "fats_g": <number>
+                    }
+                    },
+                    "mid_morning_snack": {
+                    "time": "10:30-11:00 AM",
+                    "target_calories": <number>,
+                    "include": <boolean>,
+                    "foods": [],
+                    "preparation_notes": "",
+                    "totals": {
+                        "calories": <number>,
+                        "protein_g": <number>,
+                        "carbs_g": <number>,
+                        "fats_g": <number>
+                    }
+                    },
+                    "lunch": {
+                    "time": "1:00-2:00 PM",
+                    "target_calories": <number>,
+                    "foods": [],
+                    "preparation_notes": "",
+                    "totals": {
+                        "calories": <number>,
+                        "protein_g": <number>,
+                        "carbs_g": <number>,
+                        "fats_g": <number>
+                    }
+                    },
+                    "evening_snack": {
+                    "time": "4:30-5:00 PM",
+                    "target_calories": <number>,
+                    "include": <boolean>,
+                    "foods": [],
+                    "preparation_notes": "",
+                    "totals": {
+                        "calories": <number>,
+                        "protein_g": <number>,
+                        "carbs_g": <number>,
+                        "fats_g": <number>
+                    }
+                    },
+                    "dinner": {
+                    "time": "7:30-8:30 PM",
+                    "target_calories": <number>,
+                    "foods": [],
+                    "preparation_notes": "",
+                    "totals": {
+                        "calories": <number>,
+                        "protein_g": <number>,
+                        "carbs_g": <number>,
+                        "fats_g": <number>
+                    }
+                    }
+                },
+                "daily_totals": {
+                    "calories": <number>,
+                    "protein_g": <number>,
+                    "carbs_g": <number>,
+                    "fats_g": <number>,
+                    "fiber_g": <number>
+                },
+                "target_comparison": {
+                    "calories_percentage": <number>,
+                    "protein_percentage": <number>,
+                    "carbs_percentage": <number>,
+                    "fats_percentage": <number>
+                },
+                "important_notes": [
+                    "<note 1>",
+                    "<note 2>"
+                ]
+                }
+                ```
 
-                Step 2: Use search-food-by-name to look up nutritional info for each food item
-
-                Step 3: Calculate portions to meet calorie/macro targets for that meal
-
-                Step 4: Format the meal with:
-                - Food name and quantity (e.g., "2 medium chapatis (60g)")
-                - Preparation notes if needed
-                - Nutritional breakdown
-
-                **MEAL STRUCTURE:**
-                Follow the meal distribution from the previous agent (breakfast, lunch, dinner, snacks)
-
-                **GUIDELINES:**
-                - Vegetarian: Dal, paneer, legumes, dairy, nuts for protein
-                - Non-vegetarian: Chicken, fish, eggs
-                - Indian staples: Roti, rice, dal, sabzi, raita
-                - Medical considerations:
-                * Diabetes: Whole grains, low GI foods, controlled portions
-                * Hypertension: No added salt, high potassium foods
-                * High cholesterol: Oats, fiber-rich foods, healthy fats
-
-                **OUTPUT FORMAT:**
-
-                **DAILY MEAL PLAN**
-
-                **BREAKFAST (7:00-8:00 AM)**
-                - [Food item 1] ([quantity])
-                - [Food item 2] ([quantity])
-                - [Food item 3] ([quantity])
-                Preparation: [any special notes]
-                Nutrition: Calories: X kcal | Protein: Xg | Carbs: Xg | Fats: Xg
-
-                **MID-MORNING SNACK (10:30 AM)** [if applicable]
-                [Same format]
-
-                **LUNCH (1:00-2:00 PM)**
-                [Same format]
-
-                **EVENING SNACK (4:30 PM)** [if applicable]
-                [Same format]
-
-                **DINNER (7:30-8:30 PM)**
-                [Same format]
-
-                **DAILY TOTALS:**
-                - Calories: X kcal (Target: Y kcal) - [% achieved]
-                - Protein: Xg (Target: Yg) - [% achieved]
-                - Carbs: Xg (Target: Yg) - [% achieved]
-                - Fats: Xg (Target: Yg) - [% achieved]
-
-                IMPORTANT: Always use search-food-by-name to get accurate nutritional data before finalizing portions.""",
-    tools=[nutrition_server, google_search],
-    output_key="meal_plan"
+                **IMPORTANT:** 
+                - Output ONLY valid JSON, no additional text
+                - Use web search using the web_search_tool if you need to verify nutritional values
+                - Ensure all meals follow medical guidelines from patient data""",
+    tools=[web_search_tool],
+    output_key="current_meal_plan"
 )
 
-# Agent 4: Meal Plan Validation
-meal_validation_agent = Agent(
+# Agent 4: Meal Plan Critic
+meal_plan_critic_agent = Agent(
     model=Gemini(model="gemini-2.0-flash-exp", retry_options=retry_config),
-    name="meal_validation_agent",
-    instruction="""You are a meal plan validator. Review the meal plan from the previous agent: {meal_plan}
+    name="meal_plan_critic_agent",
+    instruction="""You are a meal plan critic and validator.
 
-                **VALIDATION PROCESS:**
+                **INPUT DATA:**
+                Patient Health Data: {patient_health_data}
+                Nutrition Requirements: {nutrition_requirements}
+                Current Meal Plan: {current_meal_plan}
 
-                1. **Nutritional Accuracy:**
-                - Use search-food-by-name to verify 3-4 key foods
-                - Check if total calories match target (±100 kcal acceptable)
-                - Verify macros are within ±10% of targets
-                - Ensure calculations are correct
+                **TASK:**
+                Evaluate the meal plan and determine if it's approved or needs refinement.
 
-                2. **Medical Compliance:**
-                - Verify no contraindicated foods for medical conditions
-                - Confirm dietary restrictions respected (veg/non-veg)
-                - Check allergen considerations
-                - Validate special needs (low sodium, high fiber, low GI)
+                **EVALUATION CRITERIA:**
+                1. Nutritional Accuracy: Calories within ±100 kcal, macros within ±10%
+                2. Medical Compliance: Follows all dietary guidelines for medical conditions
+                3. Practical Assessment: Realistic portions, cultural appropriateness
+                4. Completeness: All required meals included with proper calculations
 
-                3. **Practical Assessment:**
-                - Balanced meal distribution
-                - Realistic portion sizes
-                - Variety across meals
-                - Cultural appropriateness
+                **OUTPUT FORMAT - You MUST respond with ONLY valid JSON in this exact structure:**
 
-                **IF APPROVED, provide:**
+                ```json
+                {
+                "status": "<APPROVED or NEEDS_REVISION>",
+                "nutritional_accuracy": {
+                    "calories_status": "<within_range/too_high/too_low>",
+                    "calories_difference": <number>,
+                    "protein_status": "<within_range/too_high/too_low>",
+                    "carbs_status": "<within_range/too_high/too_low>",
+                    "fats_status": "<within_range/too_high/too_low>",
+                    "overall_score": "<excellent/good/needs_improvement/poor>"
+                },
+                "medical_compliance": {
+                    "diabetes_compliance": "<compliant/non_compliant/not_applicable>",
+                    "hypertension_compliance": "<compliant/non_compliant/not_applicable>",
+                    "cholesterol_compliance": "<compliant/non_compliant/not_applicable>",
+                    "dietary_restrictions_followed": <boolean>,
+                    "overall_score": "<excellent/good/needs_improvement/poor>"
+                },
+                "practical_assessment": {
+                    "portion_sizes": "<realistic/unrealistic>",
+                    "meal_variety": "<excellent/good/poor>",
+                    "cultural_appropriateness": "<appropriate/inappropriate>",
+                    "ease_of_preparation": "<easy/moderate/difficult>",
+                    "overall_score": "<excellent/good/needs_improvement/poor>"
+                },
+                "issues": [
+                    {
+                    "category": "<nutritional/medical/practical/completeness>",
+                    "severity": "<critical/major/minor>",
+                    "problem": "<description of the problem>",
+                    "suggestion": "<specific actionable fix>"
+                    }
+                ],
+                "summary": "<brief summary of evaluation>",
+                "approval_reason": "<why approved or why not approved>"
+                }
+                ```
 
-                **✅ MEAL PLAN APPROVED**
+                **CRITICAL RULES:**
+                - Set "status" to "APPROVED" ONLY if:
+                - Nutritional accuracy overall_score is "excellent" or "good"
+                - Medical compliance overall_score is "excellent" or "good"
+                - Practical assessment overall_score is "excellent" or "good"
+                - No critical or major issues found
+                - Set "status" to "NEEDS_REVISION" if any criteria are not met
+                - Always provide specific, actionable suggestions in issues array
 
-                **Nutritional Targets Status:**
-                - Calories: [Actual] vs [Target] - ✓ [Status]
-                - Protein: [Actual]g vs [Target]g - ✓ [Status]
-                - Carbs: [Actual]g vs [Target]g - ✓ [Status]
-                - Fats: [Actual]g vs [Target]g - ✓ [Status]
+                **IMPORTANT:** 
+                - Output ONLY valid JSON, no additional text
+                - Use web search using the web_search_tool to verify nutritional values if needed""",
+    tools=[web_search_tool],
+    output_key="critique"
+)
 
-                **Medical Compliance:** ✓ All requirements met
-                - [Key compliance points]
+def exit_loop() -> Dict[str, str]:
+    """
+    Call this function ONLY when the meal plan critique status is 'APPROVED', 
+    indicating the meal plan is complete and no more changes are needed.
+    
+    Returns:
+        A dictionary with approval status
+    """
+    return {
+        "status": "approved",
+        "message": "Meal plan approved. Exiting refinement loop."
+    }
+exit_tool = FunctionTool(func=exit_loop)
 
-                **Key Highlights:**
-                - [3-4 positive aspects]
+# Agent 5: Meal Plan Refiner
+meal_plan_refiner_agent = Agent(
+    model=Gemini(model="gemini-2.0-flash-exp", retry_options=retry_config),
+    name="meal_plan_refiner_agent",
+    instruction="""You are a meal plan refiner.
 
-                **Special Considerations:**
-                - [Important notes for patient]
+                **INPUT DATA:**
+                Patient Health Data: {patient_health_data}
+                Nutrition Requirements: {nutrition_requirements}
+                Current Meal Plan: {current_meal_plan}
+                Critique: {critique}
 
-                **Usage Tips:**
-                - [Practical advice]
+                **TASK:**
+                1. Parse the critique JSON to check the status
+                2. If status is "APPROVED", call the exit_tool immediately
+                3. If status is "NEEDS_REVISION", refine the meal plan to address ALL issues
 
-                **IF ISSUES FOUND, provide:**
+                **DECISION LOGIC:**
+                ```
+                IF critique.status == "APPROVED":
+                    CALL exit_tool
+                    STOP - do not output anything else
+                ELSE:
+                    Refine the meal plan
+                    Output refined meal plan in JSON format
+                ```
 
-                **⚠️ MEAL PLAN REQUIRES REVISION**
+                **REFINEMENT PROCESS:**
+                1. Read each issue from critique.issues array
+                2. For each issue, make specific changes to address it
+                3. Use web search to get accurate nutritional data for any new/modified foods
+                4. Recalculate all nutritional values
+                5. Ensure the refined plan maintains the same JSON structure
 
-                **Issues Identified:**
-                1. [Specific issue]
-                2. [Specific issue]
+                **OUTPUT FORMAT - If refining, output ONLY valid JSON in the SAME structure as initial meal plan:**
 
-                **Required Corrections:**
-                - [What needs changing]
-                - [Which meal/food needs adjustment]
+                ```json
+                {
+                "meal_plan": {
+                    "breakfast": { ... },
+                    "mid_morning_snack": { ... },
+                    "lunch": { ... },
+                    "evening_snack": { ... },
+                    "dinner": { ... }
+                },
+                "daily_totals": { ... },
+                "target_comparison": { ... },
+                "important_notes": [ ... ],
+                "refinement_notes": [
+                    "<what was changed and why>",
+                    "<issue addressed>"
+                ]
+                }
+                ```
 
-                Use search-food-by-name to verify nutritional accuracy.""",
-    tools=[nutrition_server, google_search],
-    output_key="validated_meal_plan"
+                **IMPORTANT:** 
+                - If critique.status is "APPROVED", ONLY call exit_tool, do NOT output JSON
+                - If refining, output ONLY valid JSON, no additional text
+                - Address ALL issues from the critique
+                - Use web search to verify nutritional accuracy""",
+    tools=[exit_tool, web_search_tool],
+    output_key="current_meal_plan"
+)
+
+# Loop Agent: Meal Plan Refinement Loop
+meal_plan_refinement_loop = LoopAgent(
+    name="meal_plan_refinement_loop",
+    sub_agents=[meal_plan_critic_agent, meal_plan_refiner_agent],
+    max_iterations=3,
 )
 
 # Root Sequential Agent - Orchestrates the workflow
@@ -358,25 +547,20 @@ nutritionist_agent = SequentialAgent(
     sub_agents=[
         patient_data_agent,
         nutrition_calculator_agent,
-        meal_planning_agent,
-        meal_validation_agent
+        initial_meal_planner_agent,
+        meal_plan_refinement_loop
     ],
-    description="""You are the orchestrator of a comprehensive AI nutritionist system.
+    description="""You are the orchestrator of a comprehensive AI nutritionist system  with structured JSON data flow.
 
-                Your workflow processes user requests through four specialized agents in sequence:
+                **Workflow:**
+                1. Patient Data Agent → outputs patient_health_data (JSON)
+                2. Nutrition Calculator → uses patient_health_data, outputs nutrition_requirements (JSON)
+                3. Initial Meal Planner → uses both JSONs, outputs current_meal_plan (JSON)
+                4. Refinement Loop (max 3 iterations):
+                - Critic → evaluates meal plan, outputs critique (JSON with status)
+                - Refiner → if APPROVED calls exit_tool, else refines and outputs updated meal plan (JSON)
 
-                1. PATIENT DATA AGENT: Retrieves and analyzes health data from questionnaire and lab results
-                2. NUTRITION CALCULATOR: Determines personalized caloric and macronutrient requirements
-                3. MEAL PLANNING AGENT: Creates a detailed, personalized meal plan using nutritional database
-                4. VALIDATION AGENT: Reviews and approves the final meal plan
-
-                When a user requests "generate a meal plan for the user":
-                - Start the sequential workflow automatically
-                - Each agent receives full context from all previous agents
-                - Maintain information flow throughout the process
-                - Return the final validated meal plan to the user
-
-                Ensure smooth coordination and comprehensive output."""
+                All agents communicate via structured JSON, ensuring reliable data passing."""
 )
 
 
@@ -405,24 +589,111 @@ async def main():
     try:
         # Execute the agent workflow
         events = runner.run(user_id=USER_ID, session_id=SESSION_ID, new_message=content)
+        agent_responses = []
+        iteration_count = 0
+        # Display final meal plan 
+        # print("\n" + "=" * 80)
+        # print("FINAL MEAL PLAN")
+        # print("=" * 80)
+        # for event in events:
+        #     if event.is_final_response():
+        #         final_response = event.content.parts[0].text
+        #         print("Agent Response:", final_response)
         
-         # Display final meal plan
-        
-        print("\n" + "=" * 80)
-        print("FINAL MEAL PLAN")
-        print("=" * 80)
         for event in events:
-            if event.is_final_response():
-                final_response = event.content.parts[0].text
-                print("Agent Response:", final_response)
+            if hasattr(event, 'is_final_response') and event.is_final_response():
+                if hasattr(event, 'content') and event.content.parts:
+                    response = event.content.parts[0].text
+                    agent_name = event.author if hasattr(event, 'author') else "Unknown"
+                    
+                    # Track iterations
+                    if 'critic' in agent_name.lower():
+                        iteration_count += 1
+                    
+                    agent_responses.append({
+                        'agent': agent_name,
+                        'response': response,
+                        'iteration': iteration_count if iteration_count > 0 else None
+                    })
+        
+        # Parse and display final meal plan
+        if agent_responses:
+            final_response = agent_responses[-1]['response']
+            
+            # Try to parse as JSON for prettier display
+            try:
+                final_json = json.loads(final_response)
+                
+                print("\n" + "=" * 80)
+                print("FINAL REFINED & VALIDATED MEAL PLAN (JSON)")
+                print("=" * 80)
+                print(json.dumps(final_json, indent=2))
+                
+                # Extract and display key information
+                if 'meal_plan' in final_json:
+                    print("\n" + "=" * 80)
+                    print("MEAL SUMMARY")
+                    print("=" * 80)
+                    
+                    for meal_name, meal_data in final_json['meal_plan'].items():
+                        if meal_data.get('include', True):
+                            print(f"\n{meal_name.upper().replace('_', ' ')}:")
+                            print(f"  Time: {meal_data.get('time', 'N/A')}")
+                            print(f"  Calories: {meal_data.get('totals', {}).get('calories', 0)} kcal")
+                            print(f"  Foods:")
+                            for food in meal_data.get('foods', []):
+                                print(f"    - {food.get('name')} ({food.get('quantity')})")
+                    
+                    if 'daily_totals' in final_json:
+                        print(f"\nDAILY TOTALS:")
+                        totals = final_json['daily_totals']
+                        print(f"  Calories: {totals.get('calories', 0)} kcal")
+                        print(f"  Protein: {totals.get('protein_g', 0)}g")
+                        print(f"  Carbs: {totals.get('carbs_g', 0)}g")
+                        print(f"  Fats: {totals.get('fats_g', 0)}g")
+                
+            except json.JSONDecodeError:
+                # If not JSON, display as text
+                print("\n" + "=" * 80)
+                print("FINAL OUTPUT")
+                print("=" * 80)
+                print(final_response)
+            
+            # # Show refinement summary
+            # print("\n" + "=" * 80)
+            # print("REFINEMENT SUMMARY")
+            # print("=" * 80)
+            # print(f"Total refinement iterations: {iteration_count}")
+            
+            # # Show critique history
+            # critic_responses = [r for r in agent_responses if 'critic' in r['agent'].lower()]
+            # if critic_responses:
+            #     print(f"\nCritique iterations: {len(critic_responses)}")
+            #     for idx, critic in enumerate(critic_responses, 1):
+            #         print(f"\n--- Iteration {idx} Critique ---")
+            #         try:
+            #             critique_json = json.loads(critic['response'])
+            #             print(f"Status: {critique_json.get('status', 'UNKNOWN')}")
+            #             print(f"Summary: {critique_json.get('summary', 'N/A')}")
+            #             if critique_json.get('issues'):
+            #                 print(f"Issues found: {len(critique_json['issues'])}")
+            #         except:
+            #             print(critic['response'][:300] + "...")
+                        
+        else:
+            print("\n⚠️ No final response received from agents")
 
         
     except Exception as e:
         print(f"\n❌ Error occurred: {str(e)}")
         traceback.print_exc()
     finally:
-        # Cleanup
-        await runner.close()
+        try:
+            await runner.close()
+            print("\n✅ Runner closed successfully")
+        except Exception as cleanup_error:
+            print(f"⚠️ Cleanup error (can be ignored): {cleanup_error}")
+
 
 # Entry point
 if __name__ == "__main__":
